@@ -33,7 +33,7 @@
 在项目目录启动本地服务器：
 
 ```bash
-cd /Users/exyii/Documents/Youdoo/Submarine
+cd /...
 python3 -m http.server 5173
 ```
 
