@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Submarine Family Motion MVP</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <video id="cameraVideo" class="camera-feed" playsinline muted aria-hidden="true"></video>
+      <canvas id="gameCanvas" aria-label="海洋潜艇体感游戏画布"></canvas>
+
+      <section class="top-bar" aria-label="游戏状态">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span>海底探险</span>
+        </div>
+        <div id="statusText" class="status">准备摄像头...</div>
+        <button id="debugToggle" class="icon-button" type="button" aria-pressed="false" title="显示调试视图">
+          调试
+        </button>
+      </section>
+
+      <section id="cameraPanel" class="camera-panel" aria-label="摄像头预览">
+        <canvas id="debugCanvas" aria-label="姿态识别调试画布"></canvas>
+      </section>
+
+      <div id="messageLayer" class="message-layer" aria-live="polite"></div>
+
+      <section id="startOverlay" class="start-overlay">
+        <div class="start-card">
+          <h1>海底探险</h1>
+          <p>移动脑袋躲一躲，挥动小手发射泡泡弹。</p>
+          <button id="startButton" type="button">开始游戏</button>
+          <small>会请求摄像头权限；画面只在本地浏览器中使用。</small>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>
