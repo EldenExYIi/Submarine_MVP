@@ -642,8 +642,16 @@ function updatePlayers(poses, now) {
     existing.sub.x = lerp(existing.sub.x, pose.targetSub.x, smooth);
     existing.sub.y = lerp(existing.sub.y, pose.targetSub.y, smooth);
     existing.shoulder = pose.shoulder;
-    updateArmFromPose(existing, "left", pose.leftHand, pose.leftArmTarget, now, smooth);
-    updateArmFromPose(existing, "right", pose.rightHand, pose.rightArmTarget, now, smooth);
+    if (pose.leftHand) {
+      updateArmFromPose(existing, "left", pose.leftHand, pose.leftArmTarget, now, smooth);
+    } else {
+      updateArmFallback(existing, "left", pose.fallbackLeftHand, pose.leftArmTarget, now, smooth);
+    }
+    if (pose.rightHand) {
+      updateArmFromPose(existing, "right", pose.rightHand, pose.rightArmTarget, now, smooth);
+    } else {
+      updateArmFallback(existing, "right", pose.fallbackRightHand, pose.rightArmTarget, now, smooth);
+    }
     existing.landmarks = pose.landmarks;
     state.players[index] = existing;
   });
@@ -684,6 +692,7 @@ function createArm(side, hand, target) {
     direction: normalize({ x: target.x, y: target.y }, side === "left" ? { x: -1, y: 0 } : { x: 1, y: 0 }),
     swingDirection: normalize({ x: target.x - hand.x, y: target.y - hand.y }, side === "left" ? { x: -1, y: 0 } : { x: 1, y: 0 }),
     speed: 0,
+    handVisible: Boolean(hand?.visible),
     lastHandAt: performance.now(),
     cooldownUntil: 0,
     flashUntil: 0,
@@ -696,6 +705,7 @@ function updateArmFromPose(player, side, hand, target, now, smooth) {
   }
 
   const arm = player.arms[side];
+  const canShoot = arm.handVisible;
   const elapsed = Math.max((now - arm.lastHandAt) / 1000, 0.016);
   const motion = {
     x: hand.x - arm.hand.x,
@@ -707,6 +717,7 @@ function updateArmFromPose(player, side, hand, target, now, smooth) {
   arm.hand = { ...hand };
   arm.lastHandAt = now;
   arm.speed = speed;
+  arm.handVisible = true;
   arm.end.x = lerp(arm.end.x, target.x, smooth);
   arm.end.y = lerp(arm.end.y, target.y, smooth);
   arm.direction = normalize({ x: arm.end.x - player.sub.x, y: arm.end.y - player.sub.y }, arm.direction);
@@ -714,9 +725,24 @@ function updateArmFromPose(player, side, hand, target, now, smooth) {
     arm.swingDirection = motionDirection;
   }
 
-  if (canFireFromSwing(arm, motionDirection, speed, now)) {
+  if (canShoot && canFireFromSwing(arm, motionDirection, speed, now)) {
     fireProjectile(player, side, now, blendShotDirection(arm, motionDirection));
   }
+}
+
+function updateArmFallback(player, side, hand, target, now, smooth) {
+  if (!hand || !target) return;
+
+  const arm = player.arms[side];
+  arm.prevHand = { ...arm.hand };
+  arm.hand = { ...hand };
+  arm.lastHandAt = now;
+  arm.speed = 0;
+  arm.handVisible = false;
+  arm.end.x = lerp(arm.end.x, target.x, smooth);
+  arm.end.y = lerp(arm.end.y, target.y, smooth);
+  arm.direction = normalize({ x: arm.end.x - player.sub.x, y: arm.end.y - player.sub.y }, side === "left" ? { x: -1, y: 0 } : { x: 1, y: 0 });
+  arm.swingDirection = arm.direction;
 }
 
 function mapPoseToPlayer(landmarks, poseIndex) {
