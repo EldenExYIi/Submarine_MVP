@@ -65,7 +65,6 @@ button {
   height: 100%;
   object-fit: cover;
   opacity: 0;
-  transform: scaleX(-1);
   filter: saturate(0.95) contrast(1.04);
 }
 
@@ -329,7 +328,7 @@ button {
       <section id="startOverlay" class="start-overlay">
         <div class="start-card">
           <h1>海底探险</h1>
-          <p>移动脑袋躲一躲，从内向外快速摆手发射泡泡弹。</p>
+          <p>1-4 人一起移动脑袋躲一躲，从内向外快速摆手发射泡泡弹。</p>
           <button id="startButton" type="button">开始游戏</button>
           <small>会请求摄像头权限；画面只在本地浏览器中使用。</small>
         </div>
@@ -362,7 +361,13 @@ const WAVE_MIN_TRAVEL = 26;
 const OUTWARD_SWING_ALIGNMENT = 0.58;
 const SHOOT_COOLDOWN_MS = 560;
 const PROJECTILE_SPEED = 520;
-const POSE_INTERVAL_MS = 33;
+const CAMERA_WIDTH = 960;
+const CAMERA_HEIGHT = 540;
+const POSE_INTERVAL_MS = 66;
+const POSE_INTERVAL_MAX_MS = 120;
+const MAX_PLAYERS = 4;
+const PLAYER_MATCH_DISTANCE = 260;
+const PLAYER_LOST_TIMEOUT_MS = 1400;
 const TRACKING_OBSTACLE_CHANCE = 0.36;
 const TRACKING_STEER_ACCEL = 34;
 const TRACKING_MAX_SPEED = 118;
@@ -388,7 +393,10 @@ const state = {
   lastMessageAt: 0,
   cameraReady: false,
   poseReady: false,
+  poseCostEma: 0,
   demoMode: false,
+  multiTestMode: false,
+  verticalOnlyMode: false,
   loopStarted: false,
   pointer: {
     x: window.innerWidth * 0.5,
@@ -400,6 +408,8 @@ const state = {
 
 window.submarineMvpDebug = {
   state,
+  toggleMultiTestMode,
+  toggleVerticalOnlyMode,
 };
 
 const landmarkNames = {
@@ -502,6 +512,7 @@ function averagePoints(points) {
 
 async function startGame() {
   startButton.disabled = true;
+  state.multiTestMode = false;
   setStatus("正在请求摄像头...");
 
   try {
@@ -510,7 +521,7 @@ async function startGame() {
     await loadPoseModel();
     state.demoMode = false;
     startOverlay.classList.add("is-hidden");
-    setStatus("移动脑袋控制潜艇，左右手从内向外快速摆动时会发射泡泡弹。");
+    setStatus("1-4 人可同时加入：移动脑袋控制潜艇，左右手从内向外快速摆动时发射泡泡弹。");
     beginLoop();
   } catch (error) {
     enterDemoMode(error);
@@ -528,6 +539,7 @@ function beginLoop() {
 
 function enterDemoMode(error) {
   state.demoMode = true;
+  state.multiTestMode = false;
   if (!state.cameraReady) {
     video.classList.remove("is-visible");
   }
@@ -559,8 +571,9 @@ async function startCamera() {
 
   const stream = await navigator.mediaDevices.getUserMedia({
     video: {
-      width: { ideal: 640 },
-      height: { ideal: 480 },
+      width: { ideal: CAMERA_WIDTH },
+      height: { ideal: CAMERA_HEIGHT },
+      frameRate: { ideal: 30, max: 30 },
       facingMode: "user",
     },
     audio: false,
@@ -581,7 +594,7 @@ async function loadPoseModel() {
       delegate: "GPU",
     },
     runningMode: "VIDEO",
-    numPoses: 1,
+    numPoses: MAX_PLAYERS,
     minPoseDetectionConfidence: 0.42,
     minPosePresenceConfidence: 0.42,
     minTrackingConfidence: 0.42,
@@ -603,7 +616,7 @@ function loop(now) {
 }
 
 function updatePose(now) {
-  if (state.demoMode) {
+  if (state.demoMode || state.multiTestMode) {
     return;
   }
 
@@ -611,11 +624,14 @@ function updatePose(now) {
     return;
   }
 
-  if (now - state.lastPoseAt < POSE_INTERVAL_MS) {
+  if (now - state.lastPoseAt < getPoseInterval()) {
     return;
   }
 
+  const detectStart = performance.now();
   const result = state.poseLandmarker.detectForVideo(video, now);
+  const detectCost = performance.now() - detectStart;
+  state.poseCostEma = state.poseCostEma ? lerp(state.poseCostEma, detectCost, 0.12) : detectCost;
   state.lastPoseAt = now;
   state.lastVideoTime = video.currentTime;
   updatePlayers(result.landmarks || [], now);
@@ -624,44 +640,141 @@ function updatePose(now) {
   }
 }
 
+function getPoseInterval() {
+  const activeCount = state.players.reduce((count, player) => count + (player?.active ? 1 : 0), 0);
+  const playerPadding = Math.max(0, activeCount - 1) * 6;
+  const costPadding = state.poseCostEma > 34 ? state.poseCostEma * 0.85 : 0;
+  return clamp(POSE_INTERVAL_MS + playerPadding + costPadding, POSE_INTERVAL_MS, POSE_INTERVAL_MAX_MS);
+}
+
 function updatePlayers(poses, now) {
   const mapped = poses
     .map((landmarks, poseIndex) => mapPoseToPlayer(landmarks, poseIndex))
     .filter(Boolean)
     .sort((a, b) => a.head.x - b.head.x)
-    .slice(0, 4);
+    .slice(0, MAX_PLAYERS);
+  applyVerticalPoseTargets(mapped);
 
-  mapped.forEach((pose, index) => {
-    const existing = state.players[index] || createPlayer(index, pose);
-    const smooth = existing.active ? 0.22 : 1;
-    existing.active = true;
-    existing.lastSeenAt = now;
-    existing.color = palette[index % palette.length];
-    existing.head.x = lerp(existing.head.x, pose.head.x, smooth);
-    existing.head.y = lerp(existing.head.y, pose.head.y, smooth);
-    existing.sub.x = lerp(existing.sub.x, pose.targetSub.x, smooth);
-    existing.sub.y = lerp(existing.sub.y, pose.targetSub.y, smooth);
-    existing.shoulder = pose.shoulder;
-    if (pose.leftHand) {
-      updateArmFromPose(existing, "left", pose.leftHand, pose.leftArmTarget, now, smooth);
-    } else {
-      updateArmFallback(existing, "left", pose.fallbackLeftHand, pose.leftArmTarget, now, smooth);
-    }
-    if (pose.rightHand) {
-      updateArmFromPose(existing, "right", pose.rightHand, pose.rightArmTarget, now, smooth);
-    } else {
-      updateArmFallback(existing, "right", pose.fallbackRightHand, pose.rightArmTarget, now, smooth);
-    }
-    existing.landmarks = pose.landmarks;
-    state.players[index] = existing;
+  const assignments = assignPoseSlots(mapped, now);
+  assignments.forEach(({ pose, slot }) => {
+    const existing = state.players[slot] || createPlayer(slot, pose);
+    updatePlayerFromPose(existing, pose, slot, now);
+    state.players[slot] = existing;
   });
 
-  for (let index = mapped.length; index < state.players.length; index += 1) {
+  for (let index = 0; index < state.players.length; index += 1) {
     const player = state.players[index];
-    if (now - player.lastSeenAt > 1200) {
+    if (!player) continue;
+    if (!assignments.some((assignment) => assignment.slot === index) && now - player.lastSeenAt > PLAYER_LOST_TIMEOUT_MS) {
       player.active = false;
     }
   }
+}
+
+function assignPoseSlots(poses, now) {
+  const assignments = [];
+  const usedPoseIndexes = new Set();
+  const usedSlots = new Set();
+  const candidates = [];
+
+  state.players.forEach((player, slot) => {
+    if (!player || now - player.lastSeenAt > PLAYER_LOST_TIMEOUT_MS) return;
+    poses.forEach((pose, poseIndex) => {
+      const headDistance = distance(player.head, pose.head);
+      if (headDistance <= PLAYER_MATCH_DISTANCE) {
+        candidates.push({ slot, poseIndex, headDistance });
+      }
+    });
+  });
+
+  candidates.sort((a, b) => a.headDistance - b.headDistance);
+  candidates.forEach((candidate) => {
+    if (usedSlots.has(candidate.slot) || usedPoseIndexes.has(candidate.poseIndex)) return;
+    assignments.push({ slot: candidate.slot, pose: poses[candidate.poseIndex] });
+    usedSlots.add(candidate.slot);
+    usedPoseIndexes.add(candidate.poseIndex);
+  });
+
+  poses.forEach((pose, poseIndex) => {
+    if (usedPoseIndexes.has(poseIndex)) return;
+    const slot = findAvailablePlayerSlot(usedSlots, now, pose);
+    if (slot === -1) return;
+    assignments.push({ slot, pose });
+    usedSlots.add(slot);
+    usedPoseIndexes.add(poseIndex);
+  });
+
+  return assignments;
+}
+
+function findAvailablePlayerSlot(usedSlots, now, pose = null) {
+  for (let slot = 0; slot < MAX_PLAYERS; slot += 1) {
+    const player = state.players[slot];
+    if (!usedSlots.has(slot) && (!player || !player.active || now - player.lastSeenAt > PLAYER_LOST_TIMEOUT_MS)) {
+      return slot;
+    }
+  }
+  if (!pose) return -1;
+
+  let nearestSlot = -1;
+  let nearestDistance = Infinity;
+  for (let slot = 0; slot < MAX_PLAYERS; slot += 1) {
+    const player = state.players[slot];
+    if (usedSlots.has(slot) || !player) continue;
+    const headDistance = distance(player.head, pose.head);
+    if (headDistance < nearestDistance) {
+      nearestDistance = headDistance;
+      nearestSlot = slot;
+    }
+  }
+  return nearestSlot;
+}
+
+function updatePlayerFromPose(player, pose, slot, now) {
+  const smooth = player.active ? 0.22 : 1;
+  player.active = true;
+  player.lastSeenAt = now;
+  player.color = palette[slot % palette.length];
+  player.head.x = lerp(player.head.x, pose.head.x, smooth);
+  player.head.y = lerp(player.head.y, pose.head.y, smooth);
+  player.sub.x = lerp(player.sub.x, pose.targetSub.x, smooth);
+  player.sub.y = lerp(player.sub.y, pose.targetSub.y, smooth);
+  player.shoulder = pose.shoulder;
+  if (pose.leftHand) {
+    updateArmFromPose(player, "left", pose.leftHand, pose.leftArmTarget, now, smooth);
+  } else {
+    updateArmFallback(player, "left", pose.fallbackLeftHand, pose.leftArmTarget, now, smooth);
+  }
+  if (pose.rightHand) {
+    updateArmFromPose(player, "right", pose.rightHand, pose.rightArmTarget, now, smooth);
+  } else {
+    updateArmFallback(player, "right", pose.fallbackRightHand, pose.rightArmTarget, now, smooth);
+  }
+  player.landmarks = pose.landmarks;
+}
+
+function applyVerticalPoseTargets(poses) {
+  if (!state.verticalOnlyMode) return;
+
+  poses.forEach((pose, index) => {
+    const targetSub = getSubTarget(pose.head, index, poses.length);
+    const fallbackLeftHand = {
+      x: targetSub.x - 118,
+      y: targetSub.y + 8,
+      visible: 0.5,
+    };
+    const fallbackRightHand = {
+      x: targetSub.x + 118,
+      y: targetSub.y + 8,
+      visible: 0.5,
+    };
+
+    pose.targetSub = targetSub;
+    pose.fallbackLeftHand = fallbackLeftHand;
+    pose.fallbackRightHand = fallbackRightHand;
+    pose.leftArmTarget = pose.leftHand ? mapArmTarget(targetSub, pose.shoulder, pose.leftHand, "left") : mapArmTarget(targetSub, pose.shoulder, fallbackLeftHand, "left");
+    pose.rightArmTarget = pose.rightHand ? mapArmTarget(targetSub, pose.shoulder, pose.rightHand, "right") : mapArmTarget(targetSub, pose.shoulder, fallbackRightHand, "right");
+  });
 }
 
 function createPlayer(index, pose) {
@@ -776,11 +889,7 @@ function mapPoseToPlayer(landmarks, poseIndex) {
 
   if (!head) return null;
 
-  const playerBandOffset = (poseIndex - 0.5) * 4;
-  const targetSub = {
-    x: clamp(head.x + playerBandOffset, 72, state.width - 72),
-    y: clamp(head.y + 56, 106, state.height - 96),
-  };
+  const targetSub = getSubTarget(head, poseIndex);
   const fallbackLeftHand = {
     x: targetSub.x - 118,
     y: targetSub.y + 8,
@@ -808,6 +917,27 @@ function mapPoseToPlayer(landmarks, poseIndex) {
   };
 }
 
+function getSubTarget(head, playerIndex, playerCount = MAX_PLAYERS) {
+  const y = clamp(head.y + 56, 106, state.height - 96);
+  if (!state.verticalOnlyMode) {
+    return {
+      x: clamp(head.x + (playerIndex - 0.5) * 4, 72, state.width - 72),
+      y,
+    };
+  }
+
+  return {
+    x: getFixedPlayerX(playerIndex, playerCount),
+    y,
+  };
+}
+
+function getFixedPlayerX(playerIndex, playerCount = MAX_PLAYERS) {
+  const safeCount = clamp(Math.round(playerCount), 1, MAX_PLAYERS);
+  const gap = state.width / (safeCount + 1);
+  return clamp(gap * (playerIndex + 1), 72, state.width - 72);
+}
+
 function mapArmTarget(sub, shoulder, hand, side) {
   const fallback = side === "left" ? { x: -1, y: 0 } : { x: 1, y: 0 };
   const offset = {
@@ -823,7 +953,9 @@ function mapArmTarget(sub, shoulder, hand, side) {
 }
 
 function updateWorld(dt, now) {
-  if (state.demoMode) {
+  if (state.multiTestMode) {
+    updateMultiTestPlayers(dt, now);
+  } else if (state.demoMode) {
     updateDemoPlayer(dt, now);
   }
 
@@ -888,6 +1020,54 @@ function updateWorld(dt, now) {
   state.ripples = state.ripples.filter((ripple) => ripple.life > 0);
 }
 
+function updateMultiTestPlayers(dt, now) {
+  const baseY = state.height * 0.54;
+
+  for (let index = 0; index < MAX_PLAYERS; index += 1) {
+    const freeX = state.width * [0.17, 0.39, 0.61, 0.83][index] + Math.sin(now / 1200 + index * 1.7) * 58;
+    const targetSub = {
+      x: state.verticalOnlyMode ? getFixedPlayerX(index) : clamp(freeX, 72, state.width - 72),
+      y: clamp(baseY + Math.sin(now / 900 + index * 1.15) * 96, 106, state.height - 96),
+    };
+    const player =
+      state.players[index] ||
+      createPlayer(index, {
+        head: { x: targetSub.x, y: targetSub.y - 56, visible: 1 },
+        shoulder: { x: targetSub.x, y: targetSub.y, visible: 1 },
+        leftHand: { x: targetSub.x - 118, y: targetSub.y + 20, visible: 1 },
+        rightHand: { x: targetSub.x + 118, y: targetSub.y + 20, visible: 1 },
+        fallbackLeftHand: { x: targetSub.x - 118, y: targetSub.y + 8, visible: 0.5 },
+        fallbackRightHand: { x: targetSub.x + 118, y: targetSub.y + 8, visible: 0.5 },
+        targetSub,
+        leftArmTarget: { x: targetSub.x - 118, y: targetSub.y + 20 },
+        rightArmTarget: { x: targetSub.x + 118, y: targetSub.y + 20 },
+        landmarks: [],
+      });
+
+    const smooth = clamp(dt * 6, 0, 1);
+    player.active = true;
+    player.lastSeenAt = now;
+    player.color = palette[index % palette.length];
+    player.head = { x: targetSub.x, y: targetSub.y - 56, visible: 1 };
+    player.shoulder = { x: targetSub.x, y: targetSub.y, visible: 1 };
+    player.sub.x = lerp(player.sub.x, targetSub.x, smooth);
+    player.sub.y = lerp(player.sub.y, targetSub.y, smooth);
+
+    const leftTarget = {
+      x: clamp(targetSub.x - 108 + Math.sin(now / 250 + index) * 76, 28, state.width - 28),
+      y: clamp(targetSub.y + Math.cos(now / 330 + index * 0.8) * 82, 58, state.height - 58),
+    };
+    const rightTarget = {
+      x: clamp(targetSub.x + 108 + Math.cos(now / 260 + index) * 76, 28, state.width - 28),
+      y: clamp(targetSub.y + Math.sin(now / 320 + index * 0.9) * 82, 58, state.height - 58),
+    };
+
+    updateDemoArm(player, "left", leftTarget, now, smooth);
+    updateDemoArm(player, "right", rightTarget, now, smooth);
+    state.players[index] = player;
+  }
+}
+
 function updateObstacleTracking(obstacle, dt) {
   if (!obstacle.softTrack) return;
 
@@ -924,7 +1104,7 @@ function getNearestActivePlayer(point) {
 
 function updateDemoPlayer(dt, now) {
   const targetSub = {
-    x: clamp(state.pointer.x, 72, state.width - 72),
+    x: state.verticalOnlyMode ? getFixedPlayerX(0, 1) : clamp(state.pointer.x, 72, state.width - 72),
     y: clamp(state.pointer.y, 106, state.height - 96),
   };
   const player =
@@ -1331,9 +1511,7 @@ function drawVideoPortrait(player, x, y, radius) {
   const sourceY = clamp(sourceCenterY - sourceSize * 0.46, 0, video.videoHeight - sourceSize);
 
   ctx.save();
-  ctx.translate(x, y);
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, sourceX, sourceY, sourceSize, sourceSize, -radius, -radius, radius * 2, radius * 2);
+  ctx.drawImage(video, sourceX, sourceY, sourceSize, sourceSize, x - radius, y - radius, radius * 2, radius * 2);
   ctx.restore();
 
   ctx.fillStyle = "rgba(255,255,255,0.22)";
@@ -1590,6 +1768,33 @@ function setStatus(text) {
   statusText.textContent = text;
 }
 
+function toggleMultiTestMode() {
+  state.multiTestMode = !state.multiTestMode;
+  state.demoMode = false;
+  state.players = [];
+  state.projectiles = [];
+  state.particles = [];
+  state.ripples = [];
+  startOverlay.classList.add("is-hidden");
+
+  if (state.multiTestMode) {
+    setStatus("四人模拟测试模式：自动生成 4 名玩家。按 M 返回摄像头识别。");
+    beginLoop();
+  } else {
+    setStatus(state.cameraReady ? "已退出四人模拟测试。等待摄像头识别玩家。" : "已退出四人模拟测试。点击开始游戏或按 M 再次测试。");
+  }
+}
+
+function toggleVerticalOnlyMode() {
+  state.verticalOnlyMode = !state.verticalOnlyMode;
+  state.players = [];
+  state.projectiles = [];
+  state.particles = [];
+  state.ripples = [];
+  const modeText = state.verticalOnlyMode ? "已开启纵向调试：潜艇按当前人数横向分布，只跟随头部上下移动。" : "已关闭纵向调试：潜艇恢复跟随头部二维移动。";
+  setStatus(state.multiTestMode ? `${modeText} 当前仍在四人模拟测试模式。` : modeText);
+}
+
 debugToggle.addEventListener("click", () => {
   state.debug = !state.debug;
   debugToggle.setAttribute("aria-pressed", String(state.debug));
@@ -1614,6 +1819,16 @@ window.addEventListener("pointerdown", (event) => {
 });
 window.addEventListener("pointerup", () => {
   state.pointer.pressed = false;
+});
+window.addEventListener("keydown", (event) => {
+  const key = event.key.toLowerCase();
+  if (event.repeat) return;
+  if (key === "m") {
+    toggleMultiTestMode();
+  }
+  if (key === "v") {
+    toggleVerticalOnlyMode();
+  }
 });
 
 resizeCanvas();
